@@ -1,6 +1,16 @@
-use std::{collections::HashMap, error::Error, fs::File, process};
+use std::{collections::HashMap, error::Error, process};
 
-use csv::Trim;
+use async_std::{
+    fs::File,
+    io::stdout,
+};
+
+use csv_async::{
+    AsyncReaderBuilder,
+    AsyncSerializer,
+    Trim,
+};
+use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 
 type ClientId = u16;
@@ -148,36 +158,57 @@ fn process_tx(
 }
 
 /// Parse all transactions from the input stream and build up the ledger.
-fn parse<R>(stream: R) -> Result<Ledger, Box<dyn Error>>
+async fn parse<R>(stream: R) -> Result<Ledger, Box<dyn Error>>
 where
-    R: std::io::Read,
+    R: futures::AsyncRead + Unpin + Send + Sync,
 {
     // transaction log keeps track of processed transactions
     let mut tx_log: HashMap<TxId, Transaction> = HashMap::new();
     // ledger
     let mut ledger = HashMap::new();
 
-    let mut rdr = csv::ReaderBuilder::new()
+    let mut rdr = AsyncReaderBuilder::new()
         .flexible(true)
         .trim(Trim::All)
-        .from_reader(stream);
-    for result in rdr.deserialize() {
-        let record = result?;
+        .create_deserializer(stream);
+    let mut records = rdr.deserialize::<Transaction>();
+    while let Some(record) = records.next().await {
+        let record = record?;
         process_tx(&mut ledger, &mut tx_log, record)?;
     }
     Ok(ledger)
 }
 
 /// Print all users from the ledger with balance info to the provided stream.
-fn output<W>(ledger: &Ledger, stream: W) -> Result<(), Box<dyn Error>>
+async fn output<W>(ledger: &Ledger, stream: W) -> Result<(), Box<dyn Error>>
 where
-    W: std::io::Write,
+    W: futures::AsyncWrite + Unpin,
 {
-    let mut wtr = csv::Writer::from_writer(stream);
+    let mut wtr = AsyncSerializer::from_writer(stream);
     for (_, val) in ledger.iter() {
-        wtr.serialize(val)?;
+        wtr.serialize(val).await?;
     }
-    wtr.flush()?;
+    wtr.flush().await?;
+    Ok(())
+}
+
+async fn process_file(filename: &str) -> Result<(), String> {
+    // Open the input file
+    let file = match File::open(filename).await {
+        Ok(file) => file,
+        Err(e) => return Err(format!("Failed to open the input file {}: {}", filename, e)),
+    };
+
+    // Parse entries from the input file stream
+    let ledger = match parse(file).await {
+        Ok(ledger) => ledger,
+        Err(e) => return Err(format!("Failed to parse CSV input: {}", e)),
+    };
+
+    // Print the ledger
+    if let Err(e) = output(&ledger, stdout()).await {
+        return Err(format!("Failed to print the ledger: {}", e));
+    }
     Ok(())
 }
 
@@ -190,37 +221,20 @@ fn main() {
     }
     let filename: &str = &args[1];
 
-    // Open the input file
-    let file = match File::open(filename) {
-        Ok(file) => file,
-        Err(e) => {
-            eprintln!("Failed to open the input file {}: {}", filename, e);
+    async_std::task::block_on(async {
+        if let Err(e) = process_file(filename).await {
+            eprintln!("Error: {}", e);
             process::exit(1);
-        }
-    };
-
-    // Parse entries from the input file stream
-    let ledger = match parse(file) {
-        Ok(ledger) => ledger,
-        Err(e) => {
-            eprintln!("Failed to parse CSV input: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Print the ledger
-    if let Err(e) = output(&ledger, std::io::stdout()) {
-        eprintln!("Failed to print the ledger: {}", e);
-        process::exit(1);
-    };
+        };
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse() -> Result<(), Box<dyn Error>> {
+    #[async_std::test]
+    async fn test_parse() -> Result<(), Box<dyn Error>> {
         let input = "\
 type, client, tx, amount
 deposit, 1, 1, 1.0000001
@@ -235,7 +249,7 @@ dispute, 1, 3
 dispute, 1, 1
 chargeback, 1, 1
 ";
-        let ledger = parse(input.as_bytes())?;
+        let ledger = parse(input.as_bytes()).await?;
         assert_eq!(ledger.len(), 2);
         let clnt1 = ledger.get(&1).unwrap();
         assert_eq!(clnt1.total, 1.0);
@@ -250,8 +264,8 @@ chargeback, 1, 1
         Ok(())
     }
 
-    #[test]
-    fn test_output() -> Result<(), Box<dyn Error>> {
+    #[async_std::test]
+    async fn test_output() -> Result<(), Box<dyn Error>> {
         let mut ledger = HashMap::new();
         ledger.insert(
             1,
@@ -274,8 +288,7 @@ chargeback, 1, 1
             },
         );
         let out = Vec::new();
-        output(&ledger, out)?;
-        assert_eq!(true, true);
+        output(&ledger, out).await?;
         Ok(())
     }
 }
